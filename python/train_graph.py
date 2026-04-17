@@ -210,11 +210,21 @@ def rollout_graph(env, g_roll, obs_cpu_ref, action_int32_cpu,
     # per-step. Uses pinned memory so the H2D can be async.
     u = torch.rand(horizon, num_envs, n_actions, device="cpu", pin_memory=True)
     u.clamp_(1e-8, 1.0).log_().neg_().log_()  # -log(-log(U))   shape (H, E, A)
-    # sign flip: we compute (logits - noise).argmax ≡ (logits + (-noise)).argmax;
-    # with noise_in = log(-log(U)), Gumbel-max reduces to (logits - noise_in).argmax.
+
+    # If the env is backed by pinned memory, read obs directly from its
+    # persistent tensor -- avoids per-step torch.from_numpy allocation and
+    # enables async DMA from pinned host memory.
+    obs_source = env.obs_tensor  # None if pinned_obs=False
+
+    # Per-step reward/done scratch in pinned memory for async H2D.
+    rew_cpu = torch.zeros(num_envs, dtype=torch.float32, pin_memory=True)
+    dn_cpu  = torch.zeros(num_envs, dtype=torch.float32, pin_memory=True)
 
     for t in range(horizon):
-        g_roll.obs_in.copy_(torch.from_numpy(obs_cpu_ref[0]), non_blocking=True)
+        if obs_source is not None:
+            g_roll.obs_in.copy_(obs_source, non_blocking=True)
+        else:
+            g_roll.obs_in.copy_(torch.from_numpy(obs_cpu_ref[0]), non_blocking=True)
         g_roll.noise_in.copy_(u[t], non_blocking=True)
         g_roll.replay()
         obs_buf[t].copy_(g_roll.obs_in, non_blocking=True)
@@ -225,13 +235,16 @@ def rollout_graph(env, g_roll, obs_cpu_ref, action_int32_cpu,
         torch.cuda.synchronize()
 
         _obs, rew, term, _trunc, _info = env.step(action_int32_cpu.numpy())
-        rew_buf[t].copy_(torch.from_numpy(np.asarray(rew, dtype=np.float32)),
-                          non_blocking=True)
-        done_buf[t].copy_(torch.from_numpy(np.asarray(term, dtype=np.float32)),
-                          non_blocking=True)
+        rew_cpu.copy_(torch.from_numpy(np.asarray(rew, dtype=np.float32)))
+        dn_cpu.copy_(torch.from_numpy(np.asarray(term, dtype=np.float32)))
+        rew_buf[t].copy_(rew_cpu, non_blocking=True)
+        done_buf[t].copy_(dn_cpu, non_blocking=True)
         obs_cpu_ref[0] = _obs
 
-    g_roll.obs_in.copy_(torch.from_numpy(obs_cpu_ref[0]), non_blocking=True)
+    if obs_source is not None:
+        g_roll.obs_in.copy_(obs_source, non_blocking=True)
+    else:
+        g_roll.obs_in.copy_(torch.from_numpy(obs_cpu_ref[0]), non_blocking=True)
     g_roll.replay()
     last_v = g_roll.value_out.clone()
     return obs_buf, act_buf, rew_buf, done_buf, val_buf, logp_buf, last_v
