@@ -74,14 +74,158 @@ class PolicyMLP(Policy):
         return features, None
 
 
-def make_policy(env, hidden_size=128, mlp_map=False, channels_last=False,
-                device="cuda"):
-    cls = PolicyMLP if mlp_map else Policy
+class SparseMapLinear(nn.Module):
+    """Mathematically equivalent to Linear(1323, 64) applied to expand_compact_obs(c),
+    but reads only the rows of W that are actually selected by the one-hot /
+    binary structure of the obs. Expected ~3x forward BW savings at B=16k.
+
+    The obs has 63 tiles, each with 17 one-hot block-type channels + 4
+    binary mob channels. So the matmul reduces to:
+
+        y[b, :] = bias
+                + sum_t W[t*21 + block_id[b, t]]           (block-type rows)
+                + sum_{t, k} mob_bit[b, t, k] * W[t*21 + 17 + k]   (mob rows)
+
+    Block-type rows: fused via F.embedding_bag (sum mode).
+    Mob rows: a (B, 252) x (252, 64) Linear with binary input; still smaller
+    than the 86-MB activation read of dense Linear(1323, 64).
+    """
+    def __init__(self, n_tiles: int = 63, n_block: int = 17, n_mob: int = 4,
+                 out_features: int = 64):
+        super().__init__()
+        import math
+        self.n_tiles = n_tiles
+        self.n_block = n_block
+        self.n_mob = n_mob
+        self.out_features = out_features
+        # Same shape as the original Linear(1323, 64) weight: (n_tiles*(n_block+n_mob), out)
+        self.weight = nn.Parameter(torch.empty(n_tiles * (n_block + n_mob), out_features))
+        self.bias = nn.Parameter(torch.zeros(out_features))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+        # Precompute per-program index constants (buffers, so they move with .to(device)).
+        # tile_offs[t] = t * 21 (stride of each tile in weight)
+        self.register_buffer(
+            "tile_offs",
+            torch.arange(n_tiles, dtype=torch.long) * (n_block + n_mob),
+            persistent=False,
+        )
+        # mob_row_idx: global row indices of the mob weights (252 entries)
+        self.register_buffer(
+            "mob_row_idx",
+            (
+                torch.arange(n_tiles, dtype=torch.long).unsqueeze(-1) * (n_block + n_mob)
+                + n_block
+                + torch.arange(n_mob, dtype=torch.long)
+            ).reshape(-1),
+            persistent=False,
+        )
+        # offsets for embedding_bag: one bag per batch row, each bag has n_tiles entries.
+        self._bag_offs_cache = {}
+
+    def _bag_offs(self, B, device):
+        key = (B, device)
+        o = self._bag_offs_cache.get(key)
+        if o is None:
+            o = torch.arange(B, device=device, dtype=torch.long) * self.n_tiles
+            self._bag_offs_cache[key] = o
+        return o
+
+    def forward(self, compact):
+        # compact: (B, 145) uint8; [0..63) = block_ids, [63..126) = mob_masks.
+        import torch.nn.functional as F
+        B = compact.shape[0]
+        device = compact.device
+
+        # --- block-row contribution: embedding_bag(sum) over 63 tiles per env.
+        block_ids = compact[:, : self.n_tiles].long()            # (B, 63)
+        block_idx_flat = (self.tile_offs.unsqueeze(0) + block_ids).reshape(-1)  # (B*63,)
+        offsets = self._bag_offs(B, device)
+        block_out = F.embedding_bag(
+            block_idx_flat, self.weight, offsets, mode="sum",
+        )                                                        # (B, out)
+
+        # --- mob-row contribution: (B, 252) binary @ (252, out) Linear
+        mob_masks = compact[:, self.n_tiles : 2 * self.n_tiles]  # (B, 63) uint8
+        # Unpack 4 bits each into (B, 63, 4) float32 -> (B, 252).
+        mob_bits = torch.stack(
+            [(mob_masks >> k) & 1 for k in range(self.n_mob)], dim=-1
+        ).to(torch.float32).reshape(B, -1)                       # (B, 252)
+        mob_weight = self.weight[self.mob_row_idx]               # (252, out)
+        mob_out = mob_bits @ mob_weight                          # (B, out)
+
+        return block_out + mob_out + self.bias
+
+
+def _expand_flat_from_compact(compact: "torch.Tensor") -> "torch.Tensor":
+    """Produce the 22 flat-feature floats directly from the compact uint8 obs.
+
+    Matches the tail layout of craftax_build_obs exactly:
+      12 inv/10 + 4 HFDE/10 + 4 dir one-hot + 1 light + 1 sleep.
+    """
+    import torch.nn.functional as F
+    inv  = compact[:, 126:138].to(torch.float32) * (1.0 / 10.0)
+    hfde = compact[:, 138:142].to(torch.float32) * (1.0 / 10.0)
+    pdir = compact[:, 142].long()
+    dir_oh = F.one_hot(pdir.clamp_(0, 4), num_classes=5)[:, 1:5].to(torch.float32)
+    light = compact[:, 144:145].to(torch.float32) * (1.0 / 255.0)
+    sleep = compact[:, 143:144].to(torch.float32)
+    return torch.cat([inv, hfde, dir_oh, light, sleep], dim=-1)
+
+
+class PolicySparseMap(nn.Module):
+    """Policy that takes compact uint8 obs (B, 145) directly. No 1323-float
+    expansion, no Conv2d, no dense matmul on one-hot activations.
+
+    Same math as Policy applied to expand_compact_obs(compact) modulo the
+    light_level 1/255 quantization that's already in compact.
+    """
+    def __init__(self, env, cnn_channels: int = 32, hidden_size: int = 128, **kwargs):
+        super().__init__()
+        import pufferlib.pytorch
+        self.map_encoder = SparseMapLinear(out_features=2 * cnn_channels)
+        # The flat encoder takes 22 scalar features (same as base Policy).
+        self.flat_encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(22, hidden_size)),
+            nn.ReLU(),
+        )
+        self.proj = nn.Sequential(
+            pufferlib.pytorch.layer_init(
+                nn.Linear(2 * cnn_channels + hidden_size, hidden_size)
+            ),
+            nn.ReLU(),
+        )
+        self.actor = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, env.single_action_space.n), std=0.01,
+        )
+        self.value_fn = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1), std=1,
+        )
+        self.is_continuous = False
+
+    def forward(self, compact, state=None):
+        import torch.nn.functional as F
+        map_hidden = F.relu(self.map_encoder(compact))
+        flat = _expand_flat_from_compact(compact)
+        flat_hidden = self.flat_encoder(flat)
+        features = torch.cat([map_hidden, flat_hidden], dim=-1)
+        features = self.proj(features)
+        return self.actor(features), self.value_fn(features)
+
+    def forward_eval(self, compact, state=None):
+        return self.forward(compact, state)
+
+
+def make_policy(env, hidden_size=128, mlp_map=False, sparse_map=False,
+                channels_last=False, device="cuda"):
+    if sparse_map:
+        cls = PolicySparseMap
+    elif mlp_map:
+        cls = PolicyMLP
+    else:
+        cls = Policy
     policy = cls(env, hidden_size=hidden_size).to(device)
-    if channels_last and not mlp_map:
-        # cuDNN's fast tensor-core conv path wants NHWC -- otherwise it inserts
-        # a convertTensor kernel around every conv. Marking the Conv2d weights
-        # as channels_last eliminates that overhead.
+    if channels_last and not (mlp_map or sparse_map):
         for m in policy.map_encoder.modules():
             if isinstance(m, nn.Conv2d):
                 m.weight.data = m.weight.data.contiguous(
@@ -113,7 +257,8 @@ class GraphPPOUpdate:
 
     def __init__(self, policy, opt, mb_size: int, obs_dim: int,
                  clip=0.2, ent_coef=0.01, vf_coef=0.5, device="cuda",
-                 autocast_dtype=None, triton_loss: bool = False):
+                 autocast_dtype=None, triton_loss: bool = False,
+                 sparse_map: bool = False):
         self.policy = policy
         self.opt = opt
         self.mb_size = mb_size
@@ -123,9 +268,15 @@ class GraphPPOUpdate:
         self.device = device
         self.autocast_dtype = autocast_dtype
         self.triton_loss = triton_loss and _HAS_TRITON
+        self.sparse_map = sparse_map
 
         # Static input buffers (persistent memory; the graph's data_ptr's).
-        self.obs  = torch.zeros(mb_size, obs_dim, device=device)
+        if self.sparse_map:
+            # Compact uint8 obs fed directly to the policy.
+            self.obs = torch.zeros(mb_size, OBS_DIM_COMPACT,
+                                    dtype=torch.uint8, device=device)
+        else:
+            self.obs = torch.zeros(mb_size, obs_dim, device=device)
         self.act  = torch.zeros(mb_size, dtype=torch.int64, device=device)
         self.logp = torch.zeros(mb_size, device=device)
         self.adv  = torch.zeros(mb_size, device=device)
@@ -230,20 +381,30 @@ def sample_gumbel(logits):
 
 
 class GraphRollout:
-    """Graph-captured single-step rollout. When compact=True, `obs_in` is
-    a uint8 (B, 145) tensor and the graph body includes the on-GPU
-    expansion to (B, 1345) floats before the policy forward.
+    """Graph-captured single-step rollout.
+
+    Three obs modes:
+      * compact=False          : float (B, 1345) input, no expansion
+      * compact=True, sparse=F : uint8 (B, 145) in, expand to float (B, 1345)
+                                 inside the graph, run float policy
+      * compact=True, sparse=T : uint8 (B, 145) in, pass directly to the
+                                 policy (which must accept uint8 compact)
     """
     def __init__(self, policy, num_envs: int, obs_dim: int, n_actions: int,
-                 device="cuda", compact: bool = False, autocast_dtype=None):
+                 device="cuda", compact: bool = False, autocast_dtype=None,
+                 sparse_map: bool = False):
         self.policy = policy
         self.compact = compact
+        self.sparse_map = sparse_map and compact
         self.autocast_dtype = autocast_dtype
         if compact:
             self.obs_in = torch.zeros(num_envs, OBS_DIM_COMPACT,
                                       dtype=torch.uint8, device=device)
-            # Static expanded buffer -- reused each replay.
-            self.obs_expanded = torch.zeros(num_envs, OBS_DIM, device=device)
+            # obs_expanded only used when compact=True AND not sparse_map.
+            self.obs_expanded = (
+                None if self.sparse_map
+                else torch.zeros(num_envs, OBS_DIM, device=device)
+            )
         else:
             self.obs_in = torch.zeros(num_envs, obs_dim, device=device)
             self.obs_expanded = None
@@ -266,15 +427,17 @@ class GraphRollout:
     @torch.no_grad()
     def _step(self):
         from contextlib import nullcontext
-        if self.compact:
+        if self.sparse_map:
+            policy_in = self.obs_in              # uint8 (B, 145), policy accepts directly
+        elif self.compact:
             self.obs_expanded.copy_(expand_compact_obs(self.obs_in))
-            obs_float = self.obs_expanded
+            policy_in = self.obs_expanded
         else:
-            obs_float = self.obs_in
+            policy_in = self.obs_in
         ctx = (torch.amp.autocast("cuda", dtype=self.autocast_dtype)
                if getattr(self, "autocast_dtype", None) is not None else nullcontext())
         with ctx:
-            logits, value = self.policy.forward_eval(obs_float)
+            logits, value = self.policy.forward_eval(policy_in)
             a = (logits - self.noise_in).argmax(-1)
             lp = logits.log_softmax(-1).gather(-1, a.unsqueeze(-1)).squeeze(-1)
         self.action_out.copy_(a)
@@ -287,9 +450,19 @@ class GraphRollout:
 
 @torch.no_grad()
 def rollout_graph_compact(env, g_roll, action_int32_cpu,
-                          horizon, num_envs, obs_dim, n_actions, device):
-    """Compact-obs rollout. env must be constructed with compact_obs=True."""
-    obs_buf  = torch.zeros(horizon, num_envs, obs_dim, device=device)
+                          horizon, num_envs, obs_dim, n_actions, device,
+                          sparse_map: bool = False):
+    """Compact-obs rollout. env must be constructed with compact_obs=True.
+
+    If sparse_map=True, rollout buffer stores raw compact uint8 (37x less
+    VRAM) and the PPO update reads it back as-is. Otherwise, the graph
+    expands to float and stores the 1345-float form for the update.
+    """
+    if sparse_map:
+        obs_buf = torch.zeros(horizon, num_envs, OBS_DIM_COMPACT,
+                              dtype=torch.uint8, device=device)
+    else:
+        obs_buf = torch.zeros(horizon, num_envs, obs_dim, device=device)
     act_buf  = torch.zeros(horizon, num_envs, dtype=torch.int64, device=device)
     rew_buf  = torch.zeros(horizon, num_envs, device=device)
     done_buf = torch.zeros(horizon, num_envs, device=device)
@@ -308,9 +481,12 @@ def rollout_graph_compact(env, g_roll, action_int32_cpu,
         g_roll.obs_in.copy_(compact_src, non_blocking=True)
         g_roll.noise_in.copy_(u[t], non_blocking=True)
         g_roll.replay()
-        # obs_expanded (1345 floats/env) is the actual network input -- store it
-        # in the rollout buffer so the PPO update can reuse it directly.
-        obs_buf[t].copy_(g_roll.obs_expanded, non_blocking=True)
+        # In sparse_map mode the network consumes compact obs directly, so
+        # store obs_in. Otherwise store the float expansion the network saw.
+        if sparse_map:
+            obs_buf[t].copy_(g_roll.obs_in, non_blocking=True)
+        else:
+            obs_buf[t].copy_(g_roll.obs_expanded, non_blocking=True)
         act_buf[t].copy_(g_roll.action_out, non_blocking=True)
         val_buf[t].copy_(g_roll.value_out, non_blocking=True)
         logp_buf[t].copy_(g_roll.logprob_out, non_blocking=True)
@@ -453,6 +629,13 @@ def main():
     ap.add_argument("--triton-loss", action="store_true", default=False,
                     help="Fuse the PPO loss elementwise chain into a single "
                          "Triton kernel (fwd+bwd). ~6x on that stage.")
+    ap.add_argument("--preshuffle", action="store_true", default=False,
+                    help="Shuffle the rollout buffer once per epoch instead of "
+                         "doing obs_f[idx] gather per minibatch.")
+    ap.add_argument("--sparse-map", action="store_true", default=False,
+                    help="Use a sparse first layer that takes compact obs "
+                         "directly (no 1323-float expansion + dense matmul). "
+                         "Requires --compact.")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -468,10 +651,16 @@ def main():
         obs_initial, _ = env.reset()
     obs_dim = env.single_observation_space.shape[0]
 
+    # Sanity: --sparse-map needs the compact path end-to-end.
+    if args.sparse_map and not args.compact:
+        print("--sparse-map requires --compact (enabling it).")
+        args.compact = True
+    if args.sparse_map and not args.graph_rollout:
+        args.graph_rollout = True
     policy = make_policy(
         env, hidden_size=args.hidden,
-        mlp_map=args.mlp_map, channels_last=args.channels_last,
-        device=device,
+        mlp_map=args.mlp_map, sparse_map=args.sparse_map,
+        channels_last=args.channels_last, device=device,
     )
     opt = torch.optim.Adam(
         policy.parameters(), lr=args.lr, eps=1e-5,
@@ -496,7 +685,7 @@ def main():
         graph_updater = GraphPPOUpdate(
             policy, opt, mb_size=args.minibatch, obs_dim=obs_dim,
             device=device, autocast_dtype=_autocast_dtype,
-            triton_loss=args.triton_loss,
+            triton_loss=args.triton_loss, sparse_map=args.sparse_map,
         )
 
     g_roll = None
@@ -505,6 +694,7 @@ def main():
             policy, args.num_envs, obs_dim,
             n_actions=env.single_action_space.n, device=device,
             compact=args.compact, autocast_dtype=_autocast_dtype,
+            sparse_map=args.sparse_map,
         )
 
     # Warmup
@@ -513,6 +703,7 @@ def main():
             env, g_roll, action_int32_cpu,
             args.horizon, args.num_envs, obs_dim,
             env.single_action_space.n, device,
+            sparse_map=args.sparse_map,
         )
     else:
         _ = rollout_plain(env, policy, obs_cpu_ref, obs_gpu, action_int32_cpu,
@@ -532,6 +723,7 @@ def main():
                 env, g_roll, action_int32_cpu,
                 args.horizon, args.num_envs, obs_dim,
                 env.single_action_space.n, device,
+                sparse_map=args.sparse_map,
             )
         elif args.graph_rollout:
             obs_b, act_b, rew_b, done_b, val_b, logp_b, last_v = rollout_graph(
@@ -557,15 +749,32 @@ def main():
         N = H * E
         for _ in range(args.epochs):
             perm = torch.randperm(N, device=device)
+            if args.preshuffle and args.graph:
+                # Front-load the gather: one gather per buffer per epoch
+                # instead of per-minibatch. Static-shape slicing is a view,
+                # so copy_inputs() sees contiguous memory.
+                obs_sh  = obs_f[perm].contiguous()
+                act_sh  = act_f[perm].contiguous()
+                logp_sh = logp_f[perm].contiguous()
+                adv_sh  = adv_f[perm].contiguous()
+                ret_sh  = ret_f[perm].contiguous()
+                val_sh  = val_f[perm].contiguous()
             for start in range(0, N, MB):
                 idx = perm[start:start+MB]
                 if idx.shape[0] < MB:  # skip ragged tail for graph version
                     if args.graph: continue
                 if args.graph:
-                    graph_updater.copy_inputs(
-                        obs_f[idx], act_f[idx], logp_f[idx],
-                        adv_f[idx], ret_f[idx], val_f[idx],
-                    )
+                    if args.preshuffle:
+                        e = start + MB
+                        graph_updater.copy_inputs(
+                            obs_sh[start:e], act_sh[start:e], logp_sh[start:e],
+                            adv_sh[start:e], ret_sh[start:e], val_sh[start:e],
+                        )
+                    else:
+                        graph_updater.copy_inputs(
+                            obs_f[idx], act_f[idx], logp_f[idx],
+                            adv_f[idx], ret_f[idx], val_f[idx],
+                        )
                     graph_updater.replay()
                 else:
                     # Eager fallback (matches train_pipelined.ppo_update math)
@@ -595,7 +804,8 @@ def main():
 
     # Quick learning signal: entropy (uniform over 17 actions => ln(17) ≈ 2.833).
     with torch.no_grad():
-        obs_sample = obs_b.reshape(-1, obs_dim)[:4096]
+        last_dim = obs_b.shape[-1]
+        obs_sample = obs_b.reshape(-1, last_dim)[:4096]
         logits, _ = policy(obs_sample)
         lp = logits.log_softmax(-1)
         entropy = -(lp.exp() * lp).sum(-1).mean().item()

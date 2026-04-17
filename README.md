@@ -134,8 +134,9 @@ default policy):
 | + tuned config (K=2 MB=16k, H=128) | 1.94M |
 | + compact obs + on-GPU expansion (K=2) | 3.07M |
 | + mlp-map policy variant (drops the 2 tiny Conv2d) | 5.57M |
-| + Triton fused PPO loss kernel (sm_120) | **6.11M** |
-| + max-SPS config (K=1 MB=16k, compact, mlp-map, triton-loss) | **7.82M** |
+| + Triton fused PPO loss kernel (sm_120) | 6.11M |
+| + sparse map Linear (embedding_bag + mob-bits Linear) | **6.78M** |
+| + max-SPS config (K=1 MB=16k, compact, sparse-map, triton-loss, preshuffle) | **8.84M** |
 
 That's **~8x PufferLib's out-of-the-box throughput** at the tuned-but-still-
 quality-preserving config, and **>10x** if you're willing to drop PPO to one
