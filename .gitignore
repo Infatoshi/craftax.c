@@ -1,0 +1,8 @@
+*.o
+bench
+bench_hot
+bench_hot_pool
+bench_tp
+bench_tp_pool
+sanity
+profile/
