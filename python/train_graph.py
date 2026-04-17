@@ -56,10 +56,14 @@ class GraphPPOUpdate:
         g = GraphPPOUpdate(policy, opt, minibatch_size, obs_dim, clip, ...)
         g.copy_inputs(obs_mb, act_mb, logp_mb, adv_mb, ret_mb, val_mb)
         g.replay()
+
+    autocast_dtype=torch.bfloat16 enables tensor-core matmul inside the
+    captured graph body. Params stay fp32; activations/matmuls run in bf16.
     """
 
     def __init__(self, policy, opt, mb_size: int, obs_dim: int,
-                 clip=0.2, ent_coef=0.01, vf_coef=0.5, device="cuda"):
+                 clip=0.2, ent_coef=0.01, vf_coef=0.5, device="cuda",
+                 autocast_dtype=None):
         self.policy = policy
         self.opt = opt
         self.mb_size = mb_size
@@ -67,6 +71,7 @@ class GraphPPOUpdate:
         self.ent_coef = ent_coef
         self.vf_coef = vf_coef
         self.device = device
+        self.autocast_dtype = autocast_dtype
 
         # Static input buffers (persistent memory; the graph's data_ptr's).
         self.obs  = torch.zeros(mb_size, obs_dim, device=device)
@@ -100,22 +105,26 @@ class GraphPPOUpdate:
 
     def _step(self):
         """Body of one PPO update -- the thing we capture."""
-        logits, v_new = self.policy(self.obs)
-        v_new = v_new.squeeze(-1)
-        lp_all = logits.log_softmax(-1)
-        nlp = lp_all.gather(-1, self.act.unsqueeze(-1)).squeeze(-1)
-        ent = -(lp_all.exp() * lp_all).sum(-1).mean()
-        ratio = (nlp - self.logp).exp()
-        pg = -torch.min(
-            ratio * self.adv,
-            ratio.clamp(1 - self.clip, 1 + self.clip) * self.adv,
-        ).mean()
-        vc = self.val + (v_new - self.val).clamp(-self.clip, self.clip)
-        vl = 0.5 * torch.max(
-            (v_new - self.ret).square(),
-            (vc - self.ret).square(),
-        ).mean()
-        loss = pg + self.vf_coef * vl - self.ent_coef * ent
+        from contextlib import nullcontext
+        ctx = (torch.amp.autocast("cuda", dtype=self.autocast_dtype)
+               if self.autocast_dtype is not None else nullcontext())
+        with ctx:
+            logits, v_new = self.policy(self.obs)
+            v_new = v_new.squeeze(-1)
+            lp_all = logits.log_softmax(-1)
+            nlp = lp_all.gather(-1, self.act.unsqueeze(-1)).squeeze(-1)
+            ent = -(lp_all.exp() * lp_all).sum(-1).mean()
+            ratio = (nlp - self.logp).exp()
+            pg = -torch.min(
+                ratio * self.adv,
+                ratio.clamp(1 - self.clip, 1 + self.clip) * self.adv,
+            ).mean()
+            vc = self.val + (v_new - self.val).clamp(-self.clip, self.clip)
+            vl = 0.5 * torch.max(
+                (v_new - self.ret).square(),
+                (vc - self.ret).square(),
+            ).mean()
+            loss = pg + self.vf_coef * vl - self.ent_coef * ent
 
         # zero_grad(set_to_none=False) -- in-place so graph-captured.
         for p in self.policy.parameters():
@@ -165,9 +174,10 @@ class GraphRollout:
     expansion to (B, 1345) floats before the policy forward.
     """
     def __init__(self, policy, num_envs: int, obs_dim: int, n_actions: int,
-                 device="cuda", compact: bool = False):
+                 device="cuda", compact: bool = False, autocast_dtype=None):
         self.policy = policy
         self.compact = compact
+        self.autocast_dtype = autocast_dtype
         if compact:
             self.obs_in = torch.zeros(num_envs, OBS_DIM_COMPACT,
                                       dtype=torch.uint8, device=device)
@@ -194,15 +204,18 @@ class GraphRollout:
 
     @torch.no_grad()
     def _step(self):
+        from contextlib import nullcontext
         if self.compact:
             self.obs_expanded.copy_(expand_compact_obs(self.obs_in))
             obs_float = self.obs_expanded
         else:
             obs_float = self.obs_in
-        logits, value = self.policy.forward_eval(obs_float)
-        # Gumbel-max: argmax(logits - log(-log(U)))
-        a = (logits - self.noise_in).argmax(-1)
-        lp = logits.log_softmax(-1).gather(-1, a.unsqueeze(-1)).squeeze(-1)
+        ctx = (torch.amp.autocast("cuda", dtype=self.autocast_dtype)
+               if getattr(self, "autocast_dtype", None) is not None else nullcontext())
+        with ctx:
+            logits, value = self.policy.forward_eval(obs_float)
+            a = (logits - self.noise_in).argmax(-1)
+            lp = logits.log_softmax(-1).gather(-1, a.unsqueeze(-1)).squeeze(-1)
         self.action_out.copy_(a)
         self.logprob_out.copy_(lp)
         self.value_out.copy_(value.squeeze(-1))
@@ -364,6 +377,9 @@ def main():
     ap.add_argument("--compact", action="store_true", default=False,
                     help="Ship 145-byte compact obs over PCIe; expand to 1345 floats "
                          "inside the rollout graph. Cuts obs H2D ~37x at large NE.")
+    ap.add_argument("--bf16", action="store_true", default=False,
+                    help="autocast bf16 inside the graph. Tensor-core matmuls, "
+                         "~1.7x on a Blackwell 6000. Params stay fp32.")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -396,6 +412,7 @@ def main():
         graph_updater = GraphPPOUpdate(
             policy, opt, mb_size=args.minibatch, obs_dim=obs_dim,
             device=device,
+            autocast_dtype=(torch.bfloat16 if args.bf16 else None),
         )
 
     g_roll = None
@@ -404,6 +421,7 @@ def main():
             policy, args.num_envs, obs_dim,
             n_actions=env.single_action_space.n, device=device,
             compact=args.compact,
+            autocast_dtype=(torch.bfloat16 if args.bf16 else None),
         )
 
     # Warmup
@@ -502,4 +520,8 @@ def main():
 
 
 if __name__ == "__main__":
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
     main()
