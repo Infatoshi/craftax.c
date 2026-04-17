@@ -67,6 +67,15 @@ args["train"]["batch_size"] = BATCH
 args["train"]["minibatch_size"] = MINIBATCH
 args["train"]["use_rnn"] = False
 
+# Hyper-optimizations for this tiny (~45k param) policy. Without compile
+# on a small model the Adam kernel-launch overhead dominates wallclock.
+args["train"]["compile"] = False  # see python/README.md: hurts on this tiny model
+args["train"]["compile_mode"] = "max-autotune-no-cudagraphs"
+args["train"]["fused_adam"] = True
+# Avoid a known state_dict recursion bug in PufferLib's torch.compile path
+# (setting forward_eval on the compiled policy creates a cycle during save).
+args["train"]["checkpoint_interval"] = 10_000_000
+
 trainer = pufferl.PuffeRL(args["train"], vecenv, policy)
 
 while trainer.epoch < trainer.total_epochs:

@@ -92,8 +92,47 @@ make_env = env_creator("Craftax-C-Symbolic-v1")
 
 ## Known issues
 
-- **Blackwell (sm_120) GPU training** — PufferLib's `compute_puff_advantage`
-  custom CUDA kernel currently fails with "no kernel image is available for
-  execution on the device". Track upstream; CPU device works fine.
 - **Action dtype** — PufferEnv allocates actions as int64; we cast to int32
   via `np.copyto(..., casting='unsafe')` each step. Cheap but non-zero.
+
+## Blackwell GPU training
+
+PufferLib's shipped `_C.so` ships only sm_86 cubins, so Blackwell
+(RTX 50 / RTX PRO 6000, sm_120) fails with "no kernel image is available
+for execution on the device". Fix is a rebuild on a Blackwell host -- torch
+auto-detects the right arch and emits sm_120 cubins. Our fork at
+[Infatoshi/PufferLib @ blackwell-sm120-support](https://github.com/Infatoshi/PufferLib/tree/blackwell-sm120-support)
+also adds a `fused_adam` config option and fixes a state_dict recursion
+bug in the `torch.compile` path. To use:
+
+```bash
+git clone -b blackwell-sm120-support https://github.com/Infatoshi/PufferLib
+cd PufferLib
+TORCH_CUDA_ARCH_LIST="8.6;9.0;12.0" python -m pip install --no-build-isolation -e .
+cuobjdump --list-elf pufferlib/_C.*.so    # should list sm_120 alongside sm_86, sm_90
+```
+
+## Policy profile
+
+The default Craftax-Classic policy is a tiny 45k-param model:
+
+```
+Conv2d(21, 32, k=3, s=2)  ->  (B, 32, 3, 4)   6,080 params
+Conv2d(32, 32, k=3, s=1)  ->  (B, 32, 1, 2)   9,248 params
+Flatten                   ->  (B, 64)
+Linear(22, 128)           ->  (B, 128)        2,944 params  (flat features)
+Linear(192, 128)          ->  (B, 128)       24,704 params  (projection)
+Linear(128, 17)   actor                       2,193 params
+Linear(128, 1)    critic                        129 params
+```
+
+At the training minibatch size (4096) on a Blackwell RTX PRO 6000, one
+forward+backward+Adam step takes ~743 us plain / ~576 us with fused Adam.
+Most of that is kernel launch overhead on a model this small; compute is
+only 4 Gflop per minibatch (~40 us of pure FMA on this GPU).
+
+Empirically `torch.compile(mode="reduce-overhead")` gives 2x on fixed-shape
+microbenchmarks but regresses inside the PufferLib PPO loop (varying shapes
+trigger recompiles, and max-autotune-no-cudagraphs fusion wins less than
+the recompile cost on a 45k-param model). Enabling it via
+`args["train"]["compile"] = True` is opt-in.
