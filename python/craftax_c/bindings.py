@@ -62,6 +62,26 @@ _lib.craftax_step_batch.argtypes = [
 ]
 _lib.craftax_step_batch.restype = None
 
+# void craftax_reset_batch_compact(EnvState*, uint8_t* obs, int, uint64_t);
+_lib.craftax_reset_batch_compact.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),
+    ctypes.c_int, ctypes.c_uint64,
+]
+_lib.craftax_reset_batch_compact.restype = None
+
+# void craftax_step_batch_compact(EnvState*, const int32_t*, uint8_t* obs,
+#                                 float* rewards, int8_t* dones,
+#                                 int num_envs, uint64_t reset_seed);
+_lib.craftax_step_batch_compact.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_int32),
+    ctypes.POINTER(ctypes.c_uint8),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.POINTER(ctypes.c_int8),
+    ctypes.c_int, ctypes.c_uint64,
+]
+_lib.craftax_step_batch_compact.restype = None
+
 
 class CraftaxBatch:
     """Owns the C-side state buffer; references external numpy arrays for I/O.
@@ -133,12 +153,53 @@ class CraftaxBatch:
         )
 
     # ------------------------------------------------------------------
+    # Compact API -- 145 bytes/env instead of 5380. Expand on GPU.
+    def reset_compact(self, obs_u8: np.ndarray, seed: int | None = None) -> None:
+        self._check_compact(obs_u8)
+        s = self.seed if seed is None else int(seed)
+        _lib.craftax_reset_batch_compact(
+            self._states.ctypes.data,
+            obs_u8.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            self.num_envs, ctypes.c_uint64(s),
+        )
+        self._step_count = 0
+
+    def step_compact(self, actions: np.ndarray, obs_u8: np.ndarray,
+                     rewards: np.ndarray, terminals: np.ndarray) -> None:
+        if actions.dtype != np.int32 or actions.shape != (self.num_envs,):
+            raise ValueError("actions must be int32[num_envs]")
+        self._check_compact(obs_u8)
+        if rewards.dtype != np.float32 or rewards.shape != (self.num_envs,):
+            raise ValueError("rewards must be float32[num_envs]")
+        if terminals.dtype not in (np.int8, np.bool_, np.uint8):
+            raise TypeError("terminals must be int8/bool/uint8")
+        self._step_count += 1
+        reset_seed = self.seed + self._step_count * 1_000_003
+        _lib.craftax_step_batch_compact(
+            self._states.ctypes.data,
+            actions.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            obs_u8.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            rewards.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            terminals.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
+            self.num_envs, ctypes.c_uint64(reset_seed),
+        )
+
     def _check_obs(self, obs: np.ndarray) -> None:
         if obs.dtype != np.float32:
             raise TypeError(f"obs must be float32, got {obs.dtype}")
         if obs.shape != (self.num_envs, OBS_DIM):
             raise ValueError(
                 f"obs shape {obs.shape}, expected ({self.num_envs}, {OBS_DIM})"
+            )
+        if not obs.flags["C_CONTIGUOUS"]:
+            raise ValueError("obs must be C-contiguous")
+
+    def _check_compact(self, obs: np.ndarray) -> None:
+        if obs.dtype != np.uint8:
+            raise TypeError(f"compact obs must be uint8, got {obs.dtype}")
+        if obs.shape != (self.num_envs, OBS_DIM_COMPACT):
+            raise ValueError(
+                f"obs shape {obs.shape}, expected ({self.num_envs}, {OBS_DIM_COMPACT})"
             )
         if not obs.flags["C_CONTIGUOUS"]:
             raise ValueError("obs must be C-contiguous")

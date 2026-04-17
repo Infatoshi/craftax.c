@@ -24,7 +24,8 @@ import torch
 from torch import nn
 
 from pufferlib.environments.craftax.torch import Policy as _Policy
-from craftax_c.environment import CraftaxCEnv
+from craftax_c.environment import CraftaxCEnv, expand_compact_obs
+from craftax_c.bindings import OBS_DIM, OBS_DIM_COMPACT
 
 
 class Policy(_Policy):
@@ -159,15 +160,22 @@ def sample_gumbel(logits):
 
 
 class GraphRollout:
-    """Graph-captured single-step rollout op: static obs in, static (action,
-    logprob, value) out. Randomness for Gumbel sampling is provided via a
-    pre-filled noise buffer (regenerated on CPU each step) -- keeps the
-    graph deterministic w.r.t. its inputs.
+    """Graph-captured single-step rollout. When compact=True, `obs_in` is
+    a uint8 (B, 145) tensor and the graph body includes the on-GPU
+    expansion to (B, 1345) floats before the policy forward.
     """
     def __init__(self, policy, num_envs: int, obs_dim: int, n_actions: int,
-                 device="cuda"):
+                 device="cuda", compact: bool = False):
         self.policy = policy
-        self.obs_in    = torch.zeros(num_envs, obs_dim, device=device)
+        self.compact = compact
+        if compact:
+            self.obs_in = torch.zeros(num_envs, OBS_DIM_COMPACT,
+                                      dtype=torch.uint8, device=device)
+            # Static expanded buffer -- reused each replay.
+            self.obs_expanded = torch.zeros(num_envs, OBS_DIM, device=device)
+        else:
+            self.obs_in = torch.zeros(num_envs, obs_dim, device=device)
+            self.obs_expanded = None
         self.noise_in  = torch.zeros(num_envs, n_actions, device=device)
         self.action_out  = torch.zeros(num_envs, dtype=torch.int64, device=device)
         self.logprob_out = torch.zeros(num_envs, device=device)
@@ -186,9 +194,13 @@ class GraphRollout:
 
     @torch.no_grad()
     def _step(self):
-        logits, value = self.policy.forward_eval(self.obs_in)
+        if self.compact:
+            self.obs_expanded.copy_(expand_compact_obs(self.obs_in))
+            obs_float = self.obs_expanded
+        else:
+            obs_float = self.obs_in
+        logits, value = self.policy.forward_eval(obs_float)
         # Gumbel-max: argmax(logits - log(-log(U)))
-        # self.noise_in is expected to hold log(-log(U)) already -- generated CPU-side.
         a = (logits - self.noise_in).argmax(-1)
         lp = logits.log_softmax(-1).gather(-1, a.unsqueeze(-1)).squeeze(-1)
         self.action_out.copy_(a)
@@ -197,6 +209,50 @@ class GraphRollout:
 
     def replay(self):
         self.graph.replay()
+
+
+@torch.no_grad()
+def rollout_graph_compact(env, g_roll, action_int32_cpu,
+                          horizon, num_envs, obs_dim, n_actions, device):
+    """Compact-obs rollout. env must be constructed with compact_obs=True."""
+    obs_buf  = torch.zeros(horizon, num_envs, obs_dim, device=device)
+    act_buf  = torch.zeros(horizon, num_envs, dtype=torch.int64, device=device)
+    rew_buf  = torch.zeros(horizon, num_envs, device=device)
+    done_buf = torch.zeros(horizon, num_envs, device=device)
+    val_buf  = torch.zeros(horizon, num_envs, device=device)
+    logp_buf = torch.zeros(horizon, num_envs, device=device)
+
+    u = torch.rand(horizon, num_envs, n_actions, device="cpu", pin_memory=True)
+    u.clamp_(1e-8, 1.0).log_().neg_().log_()
+
+    compact_src = env.compact_obs_tensor  # pinned uint8 (num_envs, 145)
+    rew_cpu = torch.zeros(num_envs, dtype=torch.float32, pin_memory=True)
+    dn_cpu  = torch.zeros(num_envs, dtype=torch.float32, pin_memory=True)
+
+    for t in range(horizon):
+        # H2D: compact obs (145 B/env instead of 5380 B/env)
+        g_roll.obs_in.copy_(compact_src, non_blocking=True)
+        g_roll.noise_in.copy_(u[t], non_blocking=True)
+        g_roll.replay()
+        # obs_expanded (1345 floats/env) is the actual network input -- store it
+        # in the rollout buffer so the PPO update can reuse it directly.
+        obs_buf[t].copy_(g_roll.obs_expanded, non_blocking=True)
+        act_buf[t].copy_(g_roll.action_out, non_blocking=True)
+        val_buf[t].copy_(g_roll.value_out, non_blocking=True)
+        logp_buf[t].copy_(g_roll.logprob_out, non_blocking=True)
+        action_int32_cpu.copy_(g_roll.action_out.to(torch.int32), non_blocking=True)
+        torch.cuda.synchronize()
+
+        _obs, rew, term, _trunc, _info = env.step_compact(action_int32_cpu.numpy())
+        rew_cpu.copy_(torch.from_numpy(np.asarray(rew, dtype=np.float32)))
+        dn_cpu.copy_(torch.from_numpy(np.asarray(term, dtype=np.float32)))
+        rew_buf[t].copy_(rew_cpu, non_blocking=True)
+        done_buf[t].copy_(dn_cpu, non_blocking=True)
+
+    g_roll.obs_in.copy_(compact_src, non_blocking=True)
+    g_roll.replay()
+    last_v = g_roll.value_out.clone()
+    return obs_buf, act_buf, rew_buf, done_buf, val_buf, logp_buf, last_v
 
 
 @torch.no_grad()
@@ -305,12 +361,22 @@ def main():
                     help="Also graph-capture the per-step rollout op.")
     ap.add_argument("--hidden", type=int, default=128,
                     help="Hidden size of the policy trunk/flat encoder.")
+    ap.add_argument("--compact", action="store_true", default=False,
+                    help="Ship 145-byte compact obs over PCIe; expand to 1345 floats "
+                         "inside the rollout graph. Cuts obs H2D ~37x at large NE.")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
     device = args.device
-    env = CraftaxCEnv(num_envs=args.num_envs)
-    obs_initial, _ = env.reset()
+    if args.compact and not args.graph_rollout:
+        print("--compact requires --graph-rollout (compact path uses the rollout graph); enabling it.")
+        args.graph_rollout = True
+    env = CraftaxCEnv(num_envs=args.num_envs, compact_obs=args.compact)
+    if args.compact:
+        env.reset_compact()
+        obs_initial = env.observations  # still a (num_envs, 1345) numpy -- unused in compact path
+    else:
+        obs_initial, _ = env.reset()
     obs_dim = env.single_observation_space.shape[0]
 
     policy = Policy(env, hidden_size=args.hidden).to(device)
@@ -337,11 +403,19 @@ def main():
         g_roll = GraphRollout(
             policy, args.num_envs, obs_dim,
             n_actions=env.single_action_space.n, device=device,
+            compact=args.compact,
         )
 
     # Warmup
-    _ = rollout_plain(env, policy, obs_cpu_ref, obs_gpu, action_int32_cpu,
-                     args.horizon, args.num_envs, obs_dim, device)
+    if args.compact:
+        _ = rollout_graph_compact(
+            env, g_roll, action_int32_cpu,
+            args.horizon, args.num_envs, obs_dim,
+            env.single_action_space.n, device,
+        )
+    else:
+        _ = rollout_plain(env, policy, obs_cpu_ref, obs_gpu, action_int32_cpu,
+                         args.horizon, args.num_envs, obs_dim, device)
     torch.cuda.synchronize()
 
     print(f"graph={args.graph}  graph_rollout={args.graph_rollout}  "
@@ -352,7 +426,13 @@ def main():
     step_count = 0
     H, E, MB = args.horizon, args.num_envs, args.minibatch
     for it in range(args.iters):
-        if args.graph_rollout:
+        if args.compact:
+            obs_b, act_b, rew_b, done_b, val_b, logp_b, last_v = rollout_graph_compact(
+                env, g_roll, action_int32_cpu,
+                args.horizon, args.num_envs, obs_dim,
+                env.single_action_space.n, device,
+            )
+        elif args.graph_rollout:
             obs_b, act_b, rew_b, done_b, val_b, logp_b, last_v = rollout_graph(
                 env, g_roll, obs_cpu_ref, action_int32_cpu,
                 args.horizon, args.num_envs, obs_dim,
