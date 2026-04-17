@@ -40,6 +40,48 @@ class Policy(_Policy):
         return self.forward(observations, state)
 
 
+class PolicyMLP(Policy):
+    """Drop the 2 tiny Conv2d layers, use a single Linear(1323 -> 2*C) instead.
+
+    Why: at 7x9x21 the "image" is 63 spatial positions -- a single matmul
+    replaces two convs plus their NHWC<->NCHW layout-conversion overhead.
+    Larger param count (84k vs 15k) but one kernel call instead of five.
+    """
+    def __init__(self, env, cnn_channels=32, hidden_size=128, **kwargs):
+        super().__init__(env, cnn_channels=cnn_channels, hidden_size=hidden_size, **kwargs)
+        import pufferlib.pytorch
+        # Replace the conv-based map encoder with a single Linear.
+        from pufferlib.environments.craftax.torch import N_MAP as _N_MAP
+        self.map_encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(_N_MAP, 2 * cnn_channels)),
+            nn.ReLU(),
+        )
+
+    def encode_observations(self, observations):
+        from pufferlib.environments.craftax.torch import N_MAP as _N_MAP
+        map_obs = self.map_encoder(observations[:, :_N_MAP])
+        flat_obs = self.flat_encoder(observations[:, _N_MAP:])
+        features = torch.cat([map_obs, flat_obs], dim=1)
+        features = self.proj(features)
+        return features, None
+
+
+def make_policy(env, hidden_size=128, mlp_map=False, channels_last=False,
+                device="cuda"):
+    cls = PolicyMLP if mlp_map else Policy
+    policy = cls(env, hidden_size=hidden_size).to(device)
+    if channels_last and not mlp_map:
+        # cuDNN's fast tensor-core conv path wants NHWC -- otherwise it inserts
+        # a convertTensor kernel around every conv. Marking the Conv2d weights
+        # as channels_last eliminates that overhead.
+        for m in policy.map_encoder.modules():
+            if isinstance(m, nn.Conv2d):
+                m.weight.data = m.weight.data.contiguous(
+                    memory_format=torch.channels_last,
+                )
+    return policy
+
+
 class _E:
     class _S:
         n = 17
@@ -380,6 +422,15 @@ def main():
     ap.add_argument("--bf16", action="store_true", default=False,
                     help="autocast bf16 inside the graph. Tensor-core matmuls, "
                          "~1.7x on a Blackwell 6000. Params stay fp32.")
+    ap.add_argument("--fp16", action="store_true", default=False,
+                    help="autocast fp16 instead of bf16. Slightly faster; "
+                         "occasionally needs loss scaling.")
+    ap.add_argument("--channels-last", action="store_true", default=False,
+                    help="Store Conv2d weights in channels_last format; cuDNN "
+                         "tensor-core kernels then skip the NHWC/NCHW shuffle.")
+    ap.add_argument("--mlp-map", action="store_true", default=False,
+                    help="Replace the two Conv2d map-encoder layers with a "
+                         "single Linear(1323 -> 2C). One matmul, no conv layout.")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -395,12 +446,23 @@ def main():
         obs_initial, _ = env.reset()
     obs_dim = env.single_observation_space.shape[0]
 
-    policy = Policy(env, hidden_size=args.hidden).to(device)
+    policy = make_policy(
+        env, hidden_size=args.hidden,
+        mlp_map=args.mlp_map, channels_last=args.channels_last,
+        device=device,
+    )
     opt = torch.optim.Adam(
         policy.parameters(), lr=args.lr, eps=1e-5,
         fused=(device == "cuda"),
         capturable=(device == "cuda"),
     )
+    # Precision for autocast inside captured graphs.
+    if args.fp16:
+        _autocast_dtype = torch.float16
+    elif args.bf16:
+        _autocast_dtype = torch.bfloat16
+    else:
+        _autocast_dtype = None
 
     obs_gpu = torch.zeros(args.num_envs, obs_dim, device=device)
     action_int32_cpu = torch.zeros(args.num_envs, dtype=torch.int32,
@@ -411,8 +473,7 @@ def main():
     if args.graph:
         graph_updater = GraphPPOUpdate(
             policy, opt, mb_size=args.minibatch, obs_dim=obs_dim,
-            device=device,
-            autocast_dtype=(torch.bfloat16 if args.bf16 else None),
+            device=device, autocast_dtype=_autocast_dtype,
         )
 
     g_roll = None
@@ -420,8 +481,7 @@ def main():
         g_roll = GraphRollout(
             policy, args.num_envs, obs_dim,
             n_actions=env.single_action_space.n, device=device,
-            compact=args.compact,
-            autocast_dtype=(torch.bfloat16 if args.bf16 else None),
+            compact=args.compact, autocast_dtype=_autocast_dtype,
         )
 
     # Warmup
