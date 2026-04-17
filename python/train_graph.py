@@ -28,6 +28,9 @@ from craftax_c.environment import CraftaxCEnv
 
 
 class Policy(_Policy):
+    def __init__(self, env, cnn_channels=32, hidden_size=128, **kwargs):
+        super().__init__(env, cnn_channels=cnn_channels, hidden_size=hidden_size, **kwargs)
+
     def forward(self, observations, state=None):
         hidden, lookup = self.encode_observations(observations)
         return self.decode_actions(hidden, lookup)
@@ -300,6 +303,8 @@ def main():
                     help="Enable CUDA graph capture of minibatch update.")
     ap.add_argument("--graph-rollout", action="store_true", default=False,
                     help="Also graph-capture the per-step rollout op.")
+    ap.add_argument("--hidden", type=int, default=128,
+                    help="Hidden size of the policy trunk/flat encoder.")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -308,7 +313,7 @@ def main():
     obs_initial, _ = env.reset()
     obs_dim = env.single_observation_space.shape[0]
 
-    policy = Policy(env).to(device)
+    policy = Policy(env, hidden_size=args.hidden).to(device)
     opt = torch.optim.Adam(
         policy.parameters(), lr=args.lr, eps=1e-5,
         fused=(device == "cuda"),
@@ -406,7 +411,14 @@ def main():
 
     torch.cuda.synchronize()
     elapsed = time.time() - t_start
-    print(f"  time: {elapsed:.2f}s   steps: {step_count:,}   SPS: {step_count/elapsed:,.0f}")
+
+    # Quick learning signal: entropy (uniform over 17 actions => ln(17) ≈ 2.833).
+    with torch.no_grad():
+        obs_sample = obs_b.reshape(-1, obs_dim)[:4096]
+        logits, _ = policy(obs_sample)
+        lp = logits.log_softmax(-1)
+        entropy = -(lp.exp() * lp).sum(-1).mean().item()
+    print(f"  time: {elapsed:.2f}s   steps: {step_count:,}   SPS: {step_count/elapsed:,.0f}   final_entropy={entropy:.3f}")
 
 
 if __name__ == "__main__":
