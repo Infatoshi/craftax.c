@@ -27,6 +27,14 @@ from pufferlib.environments.craftax.torch import Policy as _Policy
 from craftax_c.environment import CraftaxCEnv, expand_compact_obs
 from craftax_c.bindings import OBS_DIM, OBS_DIM_COMPACT
 
+# Triton fused PPO loss (forward+backward). Optional: if Triton isn't
+# available, fall back to the eager elementwise chain.
+try:
+    from triton_ppo import ppo_loss_triton
+    _HAS_TRITON = True
+except Exception as _e:
+    _HAS_TRITON = False
+
 
 class Policy(_Policy):
     def __init__(self, env, cnn_channels=32, hidden_size=128, **kwargs):
@@ -105,7 +113,7 @@ class GraphPPOUpdate:
 
     def __init__(self, policy, opt, mb_size: int, obs_dim: int,
                  clip=0.2, ent_coef=0.01, vf_coef=0.5, device="cuda",
-                 autocast_dtype=None):
+                 autocast_dtype=None, triton_loss: bool = False):
         self.policy = policy
         self.opt = opt
         self.mb_size = mb_size
@@ -114,6 +122,7 @@ class GraphPPOUpdate:
         self.vf_coef = vf_coef
         self.device = device
         self.autocast_dtype = autocast_dtype
+        self.triton_loss = triton_loss and _HAS_TRITON
 
         # Static input buffers (persistent memory; the graph's data_ptr's).
         self.obs  = torch.zeros(mb_size, obs_dim, device=device)
@@ -153,22 +162,32 @@ class GraphPPOUpdate:
         with ctx:
             logits, v_new = self.policy(self.obs)
             v_new = v_new.squeeze(-1)
-            lp_all = logits.log_softmax(-1)
-            nlp = lp_all.gather(-1, self.act.unsqueeze(-1)).squeeze(-1)
-            ent = -(lp_all.exp() * lp_all).sum(-1).mean()
-            ratio = (nlp - self.logp).exp()
-            pg = -torch.min(
-                ratio * self.adv,
-                ratio.clamp(1 - self.clip, 1 + self.clip) * self.adv,
-            ).mean()
-            vc = self.val + (v_new - self.val).clamp(-self.clip, self.clip)
-            vl = 0.5 * torch.max(
-                (v_new - self.ret).square(),
-                (vc - self.ret).square(),
-            ).mean()
-            loss = pg + self.vf_coef * vl - self.ent_coef * ent
+        # PPO loss: either fused Triton kernel or the eager elementwise chain.
+        if self.triton_loss:
+            # Cast to fp32 (the Triton kernel assumes fp32; autocast may have
+            # left logits/v_new in bf16).
+            loss = ppo_loss_triton(
+                logits.float(), v_new.float(), self.act, self.logp,
+                self.adv, self.ret, self.val,
+                clip=self.clip, vf_coef=self.vf_coef, ent_coef=self.ent_coef,
+            )
+        else:
+            with ctx:
+                lp_all = logits.log_softmax(-1)
+                nlp = lp_all.gather(-1, self.act.unsqueeze(-1)).squeeze(-1)
+                ent = -(lp_all.exp() * lp_all).sum(-1).mean()
+                ratio = (nlp - self.logp).exp()
+                pg = -torch.min(
+                    ratio * self.adv,
+                    ratio.clamp(1 - self.clip, 1 + self.clip) * self.adv,
+                ).mean()
+                vc = self.val + (v_new - self.val).clamp(-self.clip, self.clip)
+                vl = 0.5 * torch.max(
+                    (v_new - self.ret).square(),
+                    (vc - self.ret).square(),
+                ).mean()
+                loss = pg + self.vf_coef * vl - self.ent_coef * ent
 
-        # zero_grad(set_to_none=False) -- in-place so graph-captured.
         for p in self.policy.parameters():
             p.grad.zero_()
         loss.backward()
@@ -431,6 +450,9 @@ def main():
     ap.add_argument("--mlp-map", action="store_true", default=False,
                     help="Replace the two Conv2d map-encoder layers with a "
                          "single Linear(1323 -> 2C). One matmul, no conv layout.")
+    ap.add_argument("--triton-loss", action="store_true", default=False,
+                    help="Fuse the PPO loss elementwise chain into a single "
+                         "Triton kernel (fwd+bwd). ~6x on that stage.")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -474,6 +496,7 @@ def main():
         graph_updater = GraphPPOUpdate(
             policy, opt, mb_size=args.minibatch, obs_dim=obs_dim,
             device=device, autocast_dtype=_autocast_dtype,
+            triton_loss=args.triton_loss,
         )
 
     g_roll = None

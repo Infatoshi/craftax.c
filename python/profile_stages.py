@@ -18,6 +18,7 @@ from craftax_c.environment import CraftaxCEnv
 
 from train_graph import (
     Policy, GraphPPOUpdate, GraphRollout, compute_gae, rollout_plain,
+    make_policy,
 )
 from craftax_c.bindings import OBS_DIM_COMPACT
 
@@ -38,6 +39,8 @@ def main():
     ap.add_argument("--minibatch", type=int, default=4096)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--compact", action="store_true", default=False)
+    ap.add_argument("--mlp-map", action="store_true", default=False)
+    ap.add_argument("--bf16", action="store_true", default=False)
     args = ap.parse_args()
 
     device = "cuda"
@@ -50,13 +53,15 @@ def main():
     obs_dim = env.single_observation_space.shape[0]
     n_actions = env.single_action_space.n
 
-    policy = Policy(env).to(device)
+    policy = make_policy(env, mlp_map=args.mlp_map, device=device)
     opt = torch.optim.Adam(policy.parameters(), lr=3e-4, eps=1e-5,
                            fused=True, capturable=True)
 
-    g_upd  = GraphPPOUpdate(policy, opt, args.minibatch, obs_dim, device=device)
+    _ac = torch.bfloat16 if args.bf16 else None
+    g_upd  = GraphPPOUpdate(policy, opt, args.minibatch, obs_dim, device=device,
+                            autocast_dtype=_ac)
     g_roll = GraphRollout(policy, args.num_envs, obs_dim, n_actions, device=device,
-                          compact=args.compact)
+                          compact=args.compact, autocast_dtype=_ac)
 
     action_i32_cpu = torch.zeros(args.num_envs, dtype=torch.int32,
                                   device="cpu", pin_memory=True)
