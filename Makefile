@@ -1,9 +1,12 @@
 CC      ?= gcc
 CFLAGS  ?= -O3 -march=native -mtune=native -ffast-math -fno-math-errno \
-           -funroll-loops -flto -fopenmp -Wall -Wextra -Wno-unused-parameter
+           -funroll-loops -flto -fopenmp -fPIC -Wall -Wextra -Wno-unused-parameter
 LDFLAGS ?= -flto -fopenmp -lm
 
-all: bench
+all: bench libcraftax.so
+
+libcraftax.so: craftax.o craftax_pool.o worker_pool.o
+	$(CC) -shared -o $@ $^ $(LDFLAGS) -lpthread
 
 bench: bench.o craftax.o craftax_pool.o worker_pool.o
 	$(CC) -o $@ $^ $(LDFLAGS) -lpthread

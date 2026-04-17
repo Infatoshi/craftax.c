@@ -5,4 +5,10 @@ bench_hot_pool
 bench_tp
 bench_tp_pool
 sanity
+libcraftax.so
 profile/
+__pycache__/
+*.egg-info/
+# PufferLib runtime artifacts
+experiments/
+resources

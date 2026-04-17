@@ -107,6 +107,24 @@ WorldPool*  wp = craftax_pool_create(/*capacity=*/4096, /*producers=*/8, 42);
 craftax_step_batch_compact_pool_tp(tp, wp, states, act, obs, rew, done, num_envs);
 ```
 
+## Training with PufferLib
+
+There's a PufferLib-compatible Python env and training script under `python/`.
+The observation layout matches PufferLib's JAX Craftax env exactly, so the
+default `pufferlib.environments.craftax.torch.Policy` runs unchanged.
+
+```bash
+make libcraftax.so
+export CRAFTAX_LIB=$PWD/libcraftax.so
+export PYTHONPATH=python
+/path/to/pufferlib/venv/bin/python python/train_craftax_c.py
+```
+
+See [python/README.md](python/README.md) for details, API, and known issues
+(Blackwell GPU training hits a PufferLib upstream kernel-arch issue; CPU
+device works). In practice the env cost drops to ~0% of training time --
+the bottleneck becomes whatever the policy side is doing.
+
 ## Correctness
 
 `sanity.c` runs 256 envs × 500 steps of uniform-random actions and reports achievement counts + reset rate. Same distribution as CUDA reference (wood / table / sapling / plant / wake_up dominate under random play).
