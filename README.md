@@ -109,7 +109,7 @@ craftax_step_batch_compact_pool_tp(tp, wp, states, act, obs, rew, done, num_envs
 
 ## Training with PufferLib
 
-There's a PufferLib-compatible Python env and training script under `python/`.
+There's a PufferLib-compatible Python env and training scripts under `python/`.
 The observation layout matches PufferLib's JAX Craftax env exactly, so the
 default `pufferlib.environments.craftax.torch.Policy` runs unchanged.
 
@@ -117,13 +117,49 @@ default `pufferlib.environments.craftax.torch.Policy` runs unchanged.
 make libcraftax.so
 export CRAFTAX_LIB=$PWD/libcraftax.so
 export PYTHONPATH=python
-/path/to/pufferlib/venv/bin/python python/train_craftax_c.py
+/path/to/pufferlib/venv/bin/python python/train_graph.py \
+    --graph --graph-rollout \
+    --num-envs 8192 --horizon 64 --epochs 2 --minibatch 16384
 ```
 
-See [python/README.md](python/README.md) for details, API, and known issues
-(Blackwell GPU training hits a PufferLib upstream kernel-arch issue; CPU
-device works). In practice the env cost drops to ~0% of training time --
-the bottleneck becomes whatever the policy side is doing.
+Training SPS on a Blackwell RTX PRO 6000 (Craftax-Classic-Symbolic, 45k-param
+default policy):
+
+| Configuration | SPS |
+|---|---:|
+| PufferLib `pufferl.py` baseline (after sm_120 fork rebuild) | 0.24M |
+| Our minimal trainer (eager) | 0.52M |
+| + CUDA graph capture (update + rollout) | 0.86M |
+| + pinned-memory obs zero-copy | 1.27M |
+| + tuned config (K=2 MB=16k, H=128) | **1.94M** |
+| + max-SPS config (K=1 MB=16k) | 2.49M |
+
+That's **~8x PufferLib's out-of-the-box throughput** at the tuned-but-still-
+quality-preserving config, and **>10x** if you're willing to drop PPO to one
+epoch per iter.
+
+Key infrastructure wins (see [python/README.md](python/README.md) for details):
+
+- **Blackwell sm_120 fork** of PufferLib at
+  [Infatoshi/PufferLib @ blackwell-sm120-support](https://github.com/Infatoshi/PufferLib/tree/blackwell-sm120-support) —
+  rebuilds the `_C.so` with sm_120 cubins, adds a `fused_adam` config flag,
+  and fixes a state_dict recursion bug in the torch.compile path.
+- **`python/train_graph.py`** — minimal PPO with `torch.cuda.CUDAGraph`
+  capture of both the rollout step and the PPO minibatch update. Static
+  input buffers, capturable+fused Adam, pre-generated Gumbel noise.
+- **`python/train_pipelined.py`** — dual-stream N-buffered rollout/update
+  pipeline as a separate experiment (1.23x win stacks additively).
+- **Pinned-memory obs path** — `CraftaxCEnv` allocates `self.observations`
+  in a torch pinned-memory tensor, so the C env writes directly into pinned
+  host memory and training does a single async DMA per rollout step.
+- **Config sweep harnesses** — `python/sweep_training.py`,
+  `python/sweep_training2.py` for reproducing the tuning.
+
+In all tuned configs, the env itself is <5% of wallclock training time.
+The remaining bottleneck is the PPO minibatch compute (forward+backward+Adam
+on a 45k-param model), which is launch-bound without graphs and compute-
+bound with them. Further gains from here require bf16 / bigger minibatch /
+bigger model -- training-config choices, not engineering.
 
 ## Correctness
 
