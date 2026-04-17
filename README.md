@@ -132,8 +132,9 @@ default policy):
 | + CUDA graph capture (update + rollout) | 0.86M |
 | + pinned-memory obs zero-copy | 1.27M |
 | + tuned config (K=2 MB=16k, H=128) | 1.94M |
-| + compact obs + on-GPU expansion (K=2) | **3.07M** |
-| + max-SPS config (K=1 MB=16k, compact) | **4.62M** |
+| + compact obs + on-GPU expansion (K=2) | 3.07M |
+| + mlp-map policy variant (drops the 2 tiny Conv2d) | **5.57M** |
+| + max-SPS config (K=1 MB=16k, compact, mlp-map) | **7.40M** |
 
 That's **~8x PufferLib's out-of-the-box throughput** at the tuned-but-still-
 quality-preserving config, and **>10x** if you're willing to drop PPO to one
