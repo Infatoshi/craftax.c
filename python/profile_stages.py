@@ -19,6 +19,7 @@ from craftax_c.environment import CraftaxCEnv
 from train_graph import (
     Policy, GraphPPOUpdate, GraphRollout, compute_gae, rollout_plain,
 )
+from craftax_c.bindings import OBS_DIM_COMPACT
 
 
 def sync():
@@ -36,11 +37,16 @@ def main():
     ap.add_argument("--epochs", type=int, default=4)
     ap.add_argument("--minibatch", type=int, default=4096)
     ap.add_argument("--iters", type=int, default=20)
+    ap.add_argument("--compact", action="store_true", default=False)
     args = ap.parse_args()
 
     device = "cuda"
-    env = CraftaxCEnv(num_envs=args.num_envs)
-    obs0, _ = env.reset()
+    env = CraftaxCEnv(num_envs=args.num_envs, compact_obs=args.compact)
+    if args.compact:
+        env.reset_compact()
+        obs0 = env.observations
+    else:
+        obs0, _ = env.reset()
     obs_dim = env.single_observation_space.shape[0]
     n_actions = env.single_action_space.n
 
@@ -49,7 +55,8 @@ def main():
                            fused=True, capturable=True)
 
     g_upd  = GraphPPOUpdate(policy, opt, args.minibatch, obs_dim, device=device)
-    g_roll = GraphRollout(policy, args.num_envs, obs_dim, n_actions, device=device)
+    g_roll = GraphRollout(policy, args.num_envs, obs_dim, n_actions, device=device,
+                          compact=args.compact)
 
     action_i32_cpu = torch.zeros(args.num_envs, dtype=torch.int32,
                                   device="cpu", pin_memory=True)
@@ -93,7 +100,10 @@ def main():
         u.clamp_(1e-8, 1.0).log_().neg_().log_()
 
         t_obs = t_noise = t_graph = t_buf = t_d2h = t_sync = t_env = t_rew = 0.0
-        obs_source = env.obs_tensor  # pinned torch tensor or None
+        if args.compact:
+            obs_source = env.compact_obs_tensor  # pinned uint8 (E, 145)
+        else:
+            obs_source = env.obs_tensor  # pinned float (E, 1345)
         for t in range(H):
             s = now()
             if obs_source is not None:
@@ -108,7 +118,12 @@ def main():
             g_roll.replay()
             sync(); t_graph += now() - s
             s = now()
-            obs_buf[t].copy_(g_roll.obs_in, non_blocking=True)
+            # In compact mode, the (B,1345) float obs for the rollout buffer
+            # lives in g_roll.obs_expanded, not obs_in (which is uint8 145).
+            obs_buf[t].copy_(
+                g_roll.obs_expanded if args.compact else g_roll.obs_in,
+                non_blocking=True,
+            )
             act_buf[t].copy_(g_roll.action_out, non_blocking=True)
             val_buf[t].copy_(g_roll.value_out, non_blocking=True)
             logp_buf[t].copy_(g_roll.logprob_out, non_blocking=True)
@@ -118,7 +133,10 @@ def main():
             sync(); t_d2h += now() - s
             s = now(); sync(); t_sync += now() - s
             s = now()
-            _obs, rew, term, _trunc, _info = env.step(action_i32_cpu.numpy())
+            if args.compact:
+                _obs, rew, term, _trunc, _info = env.step_compact(action_i32_cpu.numpy())
+            else:
+                _obs, rew, term, _trunc, _info = env.step(action_i32_cpu.numpy())
             t_env += now() - s
             s = now()
             rew_buf[t].copy_(

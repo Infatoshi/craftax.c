@@ -131,8 +131,9 @@ default policy):
 | Our minimal trainer (eager) | 0.52M |
 | + CUDA graph capture (update + rollout) | 0.86M |
 | + pinned-memory obs zero-copy | 1.27M |
-| + tuned config (K=2 MB=16k, H=128) | **1.94M** |
-| + max-SPS config (K=1 MB=16k) | 2.49M |
+| + tuned config (K=2 MB=16k, H=128) | 1.94M |
+| + compact obs + on-GPU expansion (K=2) | **3.07M** |
+| + max-SPS config (K=1 MB=16k, compact) | **4.62M** |
 
 That's **~8x PufferLib's out-of-the-box throughput** at the tuned-but-still-
 quality-preserving config, and **>10x** if you're willing to drop PPO to one
