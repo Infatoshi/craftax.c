@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "craftax.c: a C/AVX-512 reimplementation of the Craftax benchmark environment"
+authors:
+  - family-names: Arledge
+    given-names: Elliot
+    alias: Infatoshi
+repository-code: "https://github.com/Infatoshi/craftax.c"
+license: Apache-2.0
+date-released: 2026-04-27
+references:
+  - type: software
+    title: "Craftax"
+    authors:
+      - family-names: Matthews
+        given-names: Michael T.
+    repository-code: "https://github.com/MichaelTMatthews/Craftax"
+    notes: "Original JAX implementation that this project reimplements in C/AVX-512."
