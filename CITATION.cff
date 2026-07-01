@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-title: "craftax.c: a C/AVX-512 reimplementation of the Craftax benchmark environment"
+title: "craftax.c: a C/AVX-512 reimplementation of the Craftax-Classic benchmark environment"
 authors:
   - family-names: Arledge
     given-names: Elliot

@@ -3,6 +3,12 @@
 #include <stdbool.h>
 
 // ============================================================
+// This is Craftax-CLASSIC, not Craftax-Full.
+// Classic: 17 actions, 22 achievements, single 64x64 map, no
+// dungeon floors / potions / enchantments / bosses.
+// ============================================================
+
+// ============================================================
 // Constants (mirror craftax.cuh)
 // ============================================================
 #define MAP_SIZE 64

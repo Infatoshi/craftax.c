@@ -82,6 +82,9 @@ def expand_compact_obs(compact: "torch.Tensor") -> "torch.Tensor":
 class CraftaxCEnv(pufferlib.PufferEnv):
     """PufferLib-compatible env backed by craftax.c.
 
+    This is Craftax-Classic, not Craftax-Full: 17 actions, 22 achievements,
+    a single 64x64 map. No dungeon floors, potions, enchantments, or bosses.
+
     Args:
         pinned_obs: if True (default when torch+CUDA available), back self.observations
             with a torch pinned-memory tensor. The C env writes obs directly into pinned

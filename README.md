@@ -2,6 +2,8 @@
 
 Pure C / AVX-512 port of [Craftax-Classic](https://github.com/MichaelTMatthews/Craftax), optimized for a modern AMD CPU. Ports the CUDA port at [craftax.cu](https://github.com/Infatoshi/craftax.cu) back to CPU and goes faster than the GPU.
 
+> **This is Craftax-Classic, not Craftax-Full.** 17 actions, 22 achievements, a single 64x64 map. No dungeon floors, potions, enchantments, or bosses. If you want the full game, see the native C port in [PufferLib's `ocean/craftax`](https://github.com/PufferAI/PufferLib/tree/4.0/ocean/craftax).
+
 The premise: Craftax's game loop is branchy and latency-sensitive. CPUs are good at that. With enough cores, AVX-512 where it matters, and a little care about the cache hierarchy, a CPU can outrun a datacenter GPU on this workload.
 
 ## Results
